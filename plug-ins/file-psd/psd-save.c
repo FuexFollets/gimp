@@ -121,6 +121,15 @@ typedef struct PsdImageData
   GList             *lLayers;     /* List of PSD_Layer */
 } PSD_Image_Data;
 
+typedef struct PsdResourceOptions
+{
+  gboolean  cmyk;
+  gboolean  duotone;
+  gboolean  clipping_path;
+  gchar    *clipping_path_name;
+  gdouble   clipping_path_flatness;
+} PSD_Resource_Options;
+
 static PSD_Image_Data PSDImageData;
 
 /* Declare some local functions.
@@ -142,11 +151,15 @@ static void          save_color_mode_data (GOutputStream  *output,
 
 static void          save_resources       (GOutputStream  *output,
                                            GimpImage      *image,
-                                           gboolean        export_cmyk,
-                                           gboolean        export_duotone);
+                                           PSD_Resource_Options
+                                                          *options);
 
 static void          save_paths           (GOutputStream  *output,
                                            GimpImage      *image);
+static void          save_clipping_path   (GOutputStream  *output,
+                                           GimpImage      *image,
+                                           const gchar    *path_name,
+                                           gfloat          path_flatness);
 
 static void          save_layer_and_mask  (GOutputStream  *output,
                                            GimpImage      *image,
@@ -207,6 +220,10 @@ static const Babl  * get_mask_format      (GimpLayerMask  *mask);
 
 static GList       * image_get_all_layers (GimpImage      *image,
                                            gint           *n_layers);
+
+static void          update_clipping_path
+                                         (GimpIntComboBox *combo,
+                                          gpointer         data);
 
 static const gchar *
 psd_lmode_layer (GimpLayer *layer,
@@ -658,10 +675,9 @@ save_color_mode_data (GOutputStream  *output,
 }
 
 static void
-save_resources (GOutputStream  *output,
-                GimpImage      *image,
-                gboolean        export_cmyk,
-                gboolean        export_duotone)
+save_resources (GOutputStream        *output,
+                GimpImage            *image,
+                PSD_Resource_Options *options)
 {
   GList        *iter;
   gint          i;
@@ -695,7 +711,7 @@ save_resources (GOutputStream  *output,
 
 
   /* --------------- Write Channel names --------------- */
-  if (! export_cmyk)
+  if (! options->cmyk)
     {
       if (PSDImageData.nChannels > 0 ||
           gimp_drawable_has_alpha (GIMP_DRAWABLE (PSDImageData.merged_layer)))
@@ -853,6 +869,28 @@ save_resources (GOutputStream  *output,
   /* --------------- Write paths ------------------- */
   save_paths (output, image);
 
+  if (options->clipping_path)
+    {
+      GimpParasite *parasite;
+
+      save_clipping_path (output, image,
+                          options->clipping_path_name,
+                          options->clipping_path_flatness);
+
+      /* Update parasites */
+      parasite = gimp_parasite_new (PSD_PARASITE_CLIPPING_PATH, 0,
+                                    strlen (options->clipping_path_name) + 1,
+                                    options->clipping_path_name);
+      gimp_image_attach_parasite (image, parasite);
+      gimp_parasite_free (parasite);
+
+      parasite = gimp_parasite_new (PSD_PARASITE_PATH_FLATNESS, 0,
+                                    sizeof (gfloat),
+                                    (gpointer) &options->clipping_path_flatness);
+      gimp_image_attach_parasite (image, parasite);
+      gimp_parasite_free (parasite);
+    }
+
   /* --------------- Write resolution data ------------------- */
   {
     gdouble  xres = 0, yres = 0;
@@ -942,10 +980,10 @@ save_resources (GOutputStream  *output,
   {
     GimpColorProfile *profile = NULL;
 
-    if (! export_duotone)
+    if (! options->duotone)
       profile = gimp_image_get_effective_color_profile (image);
 
-    if (export_cmyk)
+    if (options->cmyk)
       {
         profile = gimp_image_get_simulation_profile (image);
 
@@ -1236,6 +1274,55 @@ save_paths (GOutputStream  *output,
     }
 
   g_list_free (vectors);
+}
+
+static void
+save_clipping_path (GOutputStream  *output,
+                    GimpImage      *image,
+                    const gchar    *path_name,
+                    gfloat          path_flatness)
+{
+  gshort   id  = 0x0BB7;
+  gsize    len;
+  GString *data;
+  gchar   *tmpname;
+  gchar    flatness[4];
+  GList   *paths;
+  GError  *err = NULL;
+
+  paths = gimp_image_list_vectors (image);
+
+  if (! paths)
+    return;
+
+  data = g_string_new ("8BIM");
+  g_string_append_c (data, id / 256);
+  g_string_append_c (data, id % 256);
+
+  tmpname = g_convert (path_name, -1, "iso8859-1", "utf-8", NULL, &len, &err);
+
+  g_string_append_len (data, "\x00\x00\x00\x00", 4);
+  if ((len + 6 + 1) <= 255)
+    g_string_append_len (data, "\x00", 1);
+  g_string_append_c (data, len + 6 + 1);
+
+  g_string_append_c (data, MIN (len, 255));
+  g_string_append_len (data, tmpname, MIN (len, 255));
+  g_free (tmpname);
+
+  if (data->len % 2)  /* padding to even size */
+    g_string_append_c (data, 0);
+
+  double_to_psd_fixed (path_flatness, flatness);
+  g_string_append_len (data, flatness, 4);
+
+  /* Adobe specifications state they ignore the fill rule,
+   * but we'll write it anyway.
+   */
+  g_string_append_len (data, "\x00\x01", 2);
+
+  xfwrite (output, data->str, data->len, "clipping path resources data");
+  g_string_free (data, TRUE);
 }
 
 static void
@@ -2038,23 +2125,25 @@ save_image (GFile      *file,
             GObject    *config,
             GError    **error)
 {
-  GOutputStream  *output;
-  GeglBuffer     *buffer;
-  GList          *iter;
-  GError         *local_error = NULL;
-  GimpParasite   *parasite    = NULL;
-  gboolean        config_cmyk;
-  gboolean        config_duotone;
+  GOutputStream        *output;
+  GeglBuffer           *buffer;
+  GList                *iter;
+  GError               *local_error = NULL;
+  GimpParasite         *parasite    = NULL;
+  PSD_Resource_Options  resource_options;
 
   g_object_get (config,
-                "cmyk",    &config_cmyk,
-                "duotone", &config_duotone,
+                "cmyk",                 &resource_options.cmyk,
+                "duotone",              &resource_options.duotone,
+                "clippingpath",         &resource_options.clipping_path,
+                "clippingpathname",     &resource_options.clipping_path_name,
+                "clippingpathflatness", &resource_options.clipping_path_flatness,
                 NULL);
 
   IFDBG(1) g_debug ("Function: save_image");
 
-  if (config_cmyk)
-    config_duotone = FALSE;
+  if (resource_options.cmyk)
+    resource_options.duotone = FALSE;
 
   if (gimp_image_get_width (image) > 30000 ||
       gimp_image_get_height (image) > 30000)
@@ -2077,13 +2166,13 @@ save_image (GFile      *file,
   if (parasite)
     {
       if (gimp_image_get_base_type (image) != GIMP_GRAY)
-        config_duotone = FALSE;
+        resource_options.duotone = FALSE;
 
       gimp_parasite_free (parasite);
     }
   else
     {
-      config_duotone = FALSE;
+      resource_options.duotone = FALSE;
     }
 
   get_image_data (image);
@@ -2137,20 +2226,20 @@ save_image (GFile      *file,
   IFDBG(1) g_debug ("\tFile '%s' has been opened",
                     gimp_file_get_utf8_name (file));
 
-  save_header (output, image, config_cmyk, config_duotone);
-  save_color_mode_data (output, image, config_duotone);
-  save_resources (output, image, config_cmyk, config_duotone);
+  save_header (output, image, resource_options.cmyk, resource_options.duotone);
+  save_color_mode_data (output, image, resource_options.duotone);
+  save_resources (output, image, &resource_options);
 
   /* PSD format does not support layers in indexed images */
 
   if (PSDImageData.baseType == GIMP_INDEXED)
     write_gint32 (output, 0, "layers info section length");
   else
-    save_layer_and_mask (output, image, config_cmyk);
+    save_layer_and_mask (output, image, resource_options.cmyk);
 
   /* If this is an indexed image, write now channel and layer info */
 
-  save_data (output, image, config_cmyk);
+  save_data (output, image, resource_options.cmyk);
 
   /* Delete merged image now */
 
@@ -2161,6 +2250,7 @@ save_image (GFile      *file,
   IFDBG(1) g_debug ("----- Closing PSD file, done -----\n");
 
   g_object_unref (output);
+  g_free (resource_options.clipping_path_name);
 
   gimp_progress_update (1.0);
 
@@ -2346,13 +2436,14 @@ save_dialog (GimpImage     *image,
   GimpColorProfile *cmyk_profile;
   GimpParasite     *parasite         = NULL;
   gboolean          has_duotone_data = FALSE;
+  GList            *paths;
   gboolean          run;
 
   dialog = gimp_procedure_dialog_new (procedure,
                                       GIMP_PROCEDURE_CONFIG (config),
                                       _("Export Image as PSD"));
 
-  /* CMYK profile label. */
+  /* CMYK profile label */
   profile_label = gimp_procedure_dialog_get_label (GIMP_PROCEDURE_DIALOG (dialog),
                                                    "profile-label", _("No soft-proofing profile"));
   gtk_label_set_xalign (GTK_LABEL (profile_label), 0.0);
@@ -2416,11 +2507,113 @@ save_dialog (GimpImage     *image,
            gimp_procedure_dialog_set_sensitive (GIMP_PROCEDURE_DIALOG (dialog),
                                                 "cmyk",
                                                 TRUE, config, "duotone", TRUE);
-
          }
 
        gimp_parasite_free (parasite);
      }
+
+  /* Clipping Path */
+  paths = gimp_image_list_vectors (image);
+  if (paths)
+    {
+      GtkWidget    *vbox;
+      GtkWidget    *frame;
+      GtkWidget    *entry;
+      GtkWidget    *combo;
+      GList        *list;
+      GtkTreeModel *model;
+      GtkTreeIter   iter;
+      gint          v;
+      gint          saved_id  = -1;
+      gchar        *path_name = NULL;
+
+      parasite = gimp_image_get_parasite (image, PSD_PARASITE_CLIPPING_PATH);
+      if (parasite)
+        {
+          guint32  parasite_size;
+
+          path_name = (gchar *) gimp_parasite_get_data (parasite, &parasite_size);
+          path_name = g_strndup (path_name, parasite_size);
+
+          gimp_parasite_free (parasite);
+        }
+
+      vbox = gtk_box_new (GTK_ORIENTATION_VERTICAL, 6);
+      combo = gimp_vectors_combo_box_new (NULL, NULL, NULL);
+
+      /* Fixing labels */
+      model = gtk_combo_box_get_model (GTK_COMBO_BOX (combo));
+      gtk_list_store_clear (GTK_LIST_STORE (model));
+      for (list = paths, v = 0;
+           list && v <= 997;
+           list = g_list_next (list), v++)
+        {
+          gtk_list_store_append (GTK_LIST_STORE (model), &iter);
+          gtk_list_store_set (GTK_LIST_STORE (model), &iter,
+                              GIMP_INT_STORE_VALUE,     gimp_item_get_id (list->data),
+                              GIMP_INT_STORE_LABEL,     gimp_item_get_name (list->data),
+                              GIMP_INT_STORE_PIXBUF,    NULL,
+                              GIMP_INT_STORE_USER_DATA, gimp_item_get_name (list->data),
+                              -1);
+
+          if (! g_strcmp0 (gimp_item_get_name (list->data),
+                           path_name))
+            saved_id = gimp_item_get_id (list->data);
+        }
+
+      if (saved_id != -1)
+        gimp_int_combo_box_set_active (GIMP_INT_COMBO_BOX (combo),
+                                       saved_id);
+
+      gimp_int_combo_box_connect (GIMP_INT_COMBO_BOX (combo),
+                                  0,
+                                  G_CALLBACK (update_clipping_path),
+                                  config, NULL);
+      gtk_widget_show (combo);
+
+      entry = gimp_procedure_dialog_get_spin_scale (GIMP_PROCEDURE_DIALOG (dialog),
+                                                    "clippingpathflatness", 1.0);
+
+      parasite = gimp_image_get_parasite (image, PSD_PARASITE_PATH_FLATNESS);
+      if (parasite)
+        {
+          gfloat  *path_flatness = NULL;
+          guint32  parasite_size;
+
+          path_flatness = (gfloat *) gimp_parasite_get_data (parasite, &parasite_size);
+          if (path_flatness && *path_flatness > 0)
+            {
+              gtk_spin_button_set_value (GTK_SPIN_BUTTON (entry), *path_flatness);
+              g_object_set (config,
+                            "clippingpathflatness", *path_flatness,
+                            NULL);
+            }
+
+          gimp_parasite_free (parasite);
+        }
+      gtk_widget_show (entry);
+
+      gimp_procedure_dialog_fill_frame (GIMP_PROCEDURE_DIALOG (dialog),
+                                                "clipping-path-frame", "clippingpath", FALSE,
+                                                NULL);
+      frame = gimp_procedure_dialog_fill_frame (GIMP_PROCEDURE_DIALOG (dialog),
+                                                "clipping-path-subframe", NULL, FALSE,
+                                                NULL);
+
+      gtk_container_add (GTK_CONTAINER (frame), vbox);
+      gtk_box_pack_start (GTK_BOX (vbox), combo, FALSE, FALSE, 0);
+      gtk_box_pack_start (GTK_BOX (vbox), entry, FALSE, FALSE, 0);
+      gtk_widget_show (vbox);
+
+      gimp_procedure_dialog_fill (GIMP_PROCEDURE_DIALOG (dialog),
+                                  "clipping-path-frame",
+                                  "clipping-path-subframe",
+                                  NULL);
+
+      gimp_procedure_dialog_set_sensitive (GIMP_PROCEDURE_DIALOG (dialog),
+                                           "clipping-path-subframe",
+                                           TRUE, config, "clippingpath", FALSE);
+    }
 
   if (has_duotone_data)
     gimp_procedure_dialog_fill (GIMP_PROCEDURE_DIALOG (dialog),
@@ -2439,4 +2632,19 @@ save_dialog (GimpImage     *image,
   gtk_widget_destroy (dialog);
 
   return run;
+}
+
+static void update_clipping_path (GimpIntComboBox *combo,
+                                  gpointer         data)
+{
+  gpointer value;
+
+  if (gimp_int_combo_box_get_active_user_data (GIMP_INT_COMBO_BOX (combo),
+                                               &value))
+    {
+      GObject *config = G_OBJECT (data);
+      g_object_set (config,
+                    "clippingpathname", (gchar *) value,
+                    NULL);
+    }
 }

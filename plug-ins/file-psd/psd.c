@@ -224,8 +224,28 @@ psd_create_procedure (GimpPlugIn  *plug_in,
       gimp_file_procedure_set_extensions (GIMP_FILE_PROCEDURE (procedure),
                                           "psd");
 
+      GIMP_PROC_ARG_BOOLEAN (procedure, "clippingpath",
+                             "Export Clipping _Path",
+                             "Export Clipping Path",
+                             FALSE,
+                             G_PARAM_READWRITE);
+
+      GIMP_PROC_ARG_STRING (procedure, "clippingpathname",
+                            "Clipping Path _Name",
+                            "Clipping path name\n"
+                            "(ignored if no clipping path)",
+                            NULL,
+                            G_PARAM_READWRITE);
+
+      GIMP_PROC_ARG_DOUBLE (procedure, "clippingpathflatness",
+                            "Path _Flatness",
+                            "Clipping path flatness in device pixels\n"
+                            "(ignored if no clipping path)",
+                            0.0, 100.0, 0.2,
+                            G_PARAM_READWRITE);
+
       GIMP_PROC_ARG_BOOLEAN (procedure, "cmyk",
-                             "Export as _CMYK",
+                             "Export as CMY_K",
                              "Export a CMYK PSD image using the soft-proofing color profile",
                              FALSE,
                              G_PARAM_READWRITE);
